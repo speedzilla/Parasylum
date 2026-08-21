@@ -39,8 +39,8 @@ DILATION_PERIOD = 11.0           # s, slow random pupil size drift
 SACCADE_MIN_GAP, SACCADE_MAX_GAP = 3.0, 9.0  # s between micro-twitches
 SACCADE_SIZE = 0.045             # twitch amplitude in gaze units
 
-NUM_EYES = 7                     # eyes on screen, varied sizes, non-overlapping
-EYE_SIZE_RANGE = (0.10, 0.30)    # radius as fraction of screen's smaller dimension
+NUM_EYES = 14                    # eyes on screen, varied sizes, non-overlapping
+EYE_SIZE_RANGE = (0.05, 0.22)    # radius as fraction of screen's smaller dimension
 
 # ----------------------------- Tracker --------------------------------------
 
@@ -283,7 +283,10 @@ def main():
 
     pygame.init()
     pygame.mouse.set_visible(False)
-    screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+    # Borderless window at screen size instead of exclusive fullscreen:
+    # looks identical, but Cmd+Tab and system dialogs keep working on macOS.
+    info = pygame.display.Info()
+    screen = pygame.display.set_mode((info.current_w, info.current_h), pygame.NOFRAME)
     clock = pygame.time.Clock()
 
     tracker = Tracker(cap)
