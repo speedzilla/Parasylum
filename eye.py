@@ -169,6 +169,44 @@ class Eye:
             pygame.draw.circle(grime, (g, g, g, self.rng.randint(14, 42)),
                                (x, y), self.rng.randint(2, 12))
         surf.blit(grime, (0, 0))
+
+        # bloodshot veins: jagged dark branches creeping in from the corners
+        # and rim toward the pupil zone; monochrome-dark red so they read as
+        # veins without breaking the grayscale look
+        veins = pygame.Surface((W, H), pygame.SRCALPHA)
+        for _ in range(18):
+            # bias start points toward the pointed corners like real bloodshot
+            corner = self.rng.random() < 0.55
+            if corner:
+                sx = 0 if self.rng.random() < 0.5 else W
+                a = 0.0 if sx == 0 else math.pi
+                a += self.rng.uniform(-0.5, 0.5)
+                px, py = sx, cy + self.rng.uniform(-0.25, 0.25) * H
+            else:
+                a = self.rng.uniform(0, 2 * math.pi)
+                px = cx + math.cos(a) * hw * 0.97
+                py = cy + math.sin(a) * hh * 0.97
+                a += math.pi  # head inward
+            shade = self.rng.randint(70, 120)
+            col = (shade, int(shade * 0.55), int(shade * 0.55),
+                   self.rng.randint(90, 150))
+            width = max(2, int(H * 0.012))
+            for _seg in range(self.rng.randint(4, 8)):
+                a += self.rng.uniform(-0.55, 0.55)
+                step = self.rng.uniform(0.05, 0.11) * W
+                nx, ny = px + math.cos(a) * step, py + math.sin(a) * step
+                # stop before invading the pupil zone
+                if abs(nx - cx) < W * 0.16 and abs(ny - cy) < H * 0.2:
+                    break
+                pygame.draw.line(veins, col, (px, py), (nx, ny), width)
+                # occasional fork
+                if self.rng.random() < 0.3:
+                    fa = a + self.rng.uniform(-1.0, 1.0)
+                    fx, fy = nx + math.cos(fa) * step * 0.6, ny + math.sin(fa) * step * 0.6
+                    pygame.draw.line(veins, col, (nx, ny), (fx, fy), max(1, width - 1))
+                px, py = nx, ny
+                width = max(1, width - (1 if self.rng.random() < 0.4 else 0))
+        surf.blit(veins, (0, 0))
         mask = pygame.Surface((W, H), pygame.SRCALPHA)
         pygame.draw.polygon(mask, (255, 255, 255, 255), outline)
         surf.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
