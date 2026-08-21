@@ -8,6 +8,7 @@ Runs offline. ESC or Q quits. No config needed; tunables below.
 """
 
 import sys
+import os
 import time
 import math
 import random
@@ -301,10 +302,60 @@ def layout_eyes(screen):
 
 # ----------------------------- Main -----------------------------------------
 
-def open_camera():
+def make_grunge(w, h, seed=11):
+    """Static film-grime overlay: vignette, dust, scratches, smudges.
+    Pre-rendered once, blitted every frame."""
+    rng = random.Random(seed)
+    surf = pygame.Surface((w, h), pygame.SRCALPHA)
+
+    # vignette: darkened corners/edges
+    steps = 26
+    maxr = int(math.hypot(w, h) * 0.62)
+    for k in range(steps):
+        t = k / (steps - 1)
+        a = int(110 * (t ** 2.2))
+        r = int(maxr * (1 - 0.35 * t))
+        ring = pygame.Surface((w, h), pygame.SRCALPHA)
+        pygame.draw.circle(ring, (0, 0, 0, a), (w // 2, h // 2), r,
+                           width=max(2, maxr // steps + 2))
+        surf.blit(ring, (0, 0))
+
+    # dust specks
+    for _ in range(w * h // 4500):
+        x = rng.randint(0, w - 1); y = rng.randint(0, h - 1)
+        g = rng.randint(120, 220)
+        surf.set_at((x, y), (g, g, g, rng.randint(20, 70)))
+
+    # scratches: long faint vertical-ish lines
+    for _ in range(10):
+        x = rng.randint(0, w - 1)
+        drift = rng.uniform(-0.06, 0.06)
+        g = rng.randint(140, 210)
+        a = rng.randint(10, 26)
+        y0 = rng.randint(0, h // 3)
+        y1 = rng.randint(2 * h // 3, h - 1)
+        pts = [(x + (y - y0) * drift + rng.uniform(-1, 1), y)
+               for y in range(y0, y1, 6)]
+        if len(pts) > 1:
+            pygame.draw.lines(surf, (g, g, g, a), False, pts, 1)
+
+    # smudges: big soft dark blotches
+    for _ in range(18):
+        x = rng.randint(0, w - 1); y = rng.randint(0, h - 1)
+        rad = rng.randint(int(h * 0.03), int(h * 0.12))
+        blot = pygame.Surface((rad * 2, rad * 2), pygame.SRCALPHA)
+        for rr in range(rad, 0, -2):
+            a = int(14 * (1 - rr / rad) + 2)
+            pygame.draw.circle(blot, (10, 10, 10, a), (rad, rad), rr)
+        surf.blit(blot, (x - rad, y - rad))
+
+    return surf
+
+
+def open_camera(index=CAM_INDEX):
     """Must run on the main thread: macOS ties the camera permission prompt
     to the main run loop."""
-    cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW if sys.platform == "win32" else 0)
+    cap = cv2.VideoCapture(index, cv2.CAP_DSHOW if sys.platform == "win32" else 0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
     # Fight auto-exposure: in a dark room we want the LED as a tight dot,
@@ -319,10 +370,12 @@ def open_camera():
 def main():
     cap = open_camera()
 
+    os.environ["SDL_VIDEO_WINDOW_POS"] = "0,0"
     pygame.init()
     pygame.mouse.set_visible(False)
     # Borderless window at screen size instead of exclusive fullscreen:
     # looks identical, but Cmd+Tab and system dialogs keep working on macOS.
+    # Press F for true fullscreen if the window doesn't cover the screen.
     info = pygame.display.Info()
     screen = pygame.display.set_mode((info.current_w, info.current_h), pygame.NOFRAME)
     clock = pygame.time.Clock()
@@ -332,6 +385,9 @@ def main():
 
     eyes = layout_eyes(screen)
     sw, sh = screen.get_size()
+    grunge = make_grunge(sw, sh)
+    cam_index = CAM_INDEX
+    fullscreen = False
     debug = False
     running = True
     while running:
@@ -343,6 +399,25 @@ def main():
                     running = False
                 if ev.key == pygame.K_d:
                     debug = not debug
+                if ev.key == pygame.K_f:
+                    fullscreen = not fullscreen
+                    flags = pygame.FULLSCREEN if fullscreen else pygame.NOFRAME
+                    screen = pygame.display.set_mode((sw, sh), flags)
+                    for e in eyes:
+                        e.screen = screen
+                if ev.key == pygame.K_c:
+                    # cycle to next camera (phone vs built-in); wraps at 4
+                    tracker.stop()
+                    tracker.join(timeout=1.0)
+                    cap.release()
+                    for _try in range(4):
+                        cam_index = (cam_index + 1) % 4
+                        cap = open_camera(cam_index)
+                        if cap.isOpened() and cap.read()[0]:
+                            break
+                        cap.release()
+                    tracker = Tracker(cap)
+                    tracker.start()
 
         now = time.time()
         tracking = (now - tracker.last_seen) < LOST_TIMEOUT
@@ -361,6 +436,8 @@ def main():
                 dx, dy = dx / mag, dy / mag
             eye.update([dx, dy], tracking, now)
             eye.draw(now)
+
+        screen.blit(grunge, (0, 0))
 
         if debug and tracker.debug_frame is not None:
             f = cv2.cvtColor(tracker.debug_frame, cv2.COLOR_BGR2RGB)
