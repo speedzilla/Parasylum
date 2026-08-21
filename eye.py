@@ -40,8 +40,8 @@ DILATION_PERIOD = 11.0           # s, slow random pupil size drift
 SACCADE_MIN_GAP, SACCADE_MAX_GAP = 0.6, 3.5  # s between micro-twitches
 SACCADE_SIZE = 0.11              # twitch amplitude in gaze units
 
-NUM_EYES = 22                    # eyes on screen, varied sizes, non-overlapping
-EYE_SIZE_RANGE = (0.04, 0.19)    # radius as fraction of screen's smaller dimension
+NUM_EYES = 10                    # eyes on screen, varied sizes, non-overlapping
+EYE_SIZE_RANGE = (0.14, 0.30)    # radius as fraction of screen's smaller dimension
 
 # ----------------------------- Tracker --------------------------------------
 
@@ -288,8 +288,8 @@ def layout_eyes(screen):
         eh = int(ew * 0.62)
         x = rng.randint(ew // 2, max(ew // 2 + 1, w - ew // 2))
         y = rng.randint(eh // 2, max(eh // 2 + 1, h - eh // 2))
-        pad = int(base * 0.02)
-        if all((x - px) ** 2 + (y - py) ** 2 >= ((ew + pw) / 2 * 0.85 + pad) ** 2
+        pad = int(base * 0.005)
+        if all((x - px) ** 2 + (y - py) ** 2 >= ((ew + pw) / 2 * 0.72 + pad) ** 2
                for px, py, pw in placed):
             placed.append((x, y, ew))
         attempts += 1
