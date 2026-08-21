@@ -28,43 +28,42 @@ HSV_UPPER_1 = (12, 255, 255)
 HSV_LOWER_2 = (168, 90, 160)
 HSV_UPPER_2 = (180, 255, 255)
 MIN_BLOB_AREA = 8        # px; below this = noise
-GAZE_SMOOTHING = 0.12    # 0..1, lower = smoother/slower eye
+GAZE_SMOOTHING = 0.055   # 0..1, lower = smoother/slower eye
 LOST_TIMEOUT = 1.5       # s without a blob before eye wanders idly
 
 # Eye look
 IRIS_COLOR = (70, 110, 140)     # steel blue; try (110, 80, 50) for brown
-BLINK_MIN_GAP, BLINK_MAX_GAP = 2.5, 7.0   # s between random blinks
-BLINK_DURATION = 0.22            # s for a full blink
+BLINK_MIN_GAP, BLINK_MAX_GAP = 5.0, 14.0  # s between random blinks; long stares
+BLINK_DURATION = 0.30            # s for a full blink, slightly languid
 DILATION_PERIOD = 11.0           # s, slow random pupil size drift
+SACCADE_MIN_GAP, SACCADE_MAX_GAP = 3.0, 9.0  # s between micro-twitches
+SACCADE_SIZE = 0.045             # twitch amplitude in gaze units
 
 # ----------------------------- Tracker --------------------------------------
 
 class Tracker(threading.Thread):
     """Reads webcam frames, finds the largest red blob, publishes its
-    normalized position (-1..1 both axes, 0,0 = center) and a seen-timestamp."""
+    normalized position (-1..1 both axes, 0,0 = center) and a seen-timestamp.
+    The VideoCapture must be created on the main thread (macOS requires the
+    camera permission request to happen there) and passed in."""
 
-    def __init__(self):
+    def __init__(self, cap):
         super().__init__(daemon=True)
+        self.cap = cap
         self.pos = (0.0, 0.0)
         self.last_seen = 0.0
-        self.ok = False
+        self.ok = cap is not None and cap.isOpened()
         self.debug_frame = None   # BGR frame with blob annotation, for debug view
-        self._stop = threading.Event()
+        self._halt = threading.Event()
 
     def stop(self):
-        self._stop.set()
+        self._halt.set()
 
     def run(self):
-        cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW if sys.platform == "win32" else 0)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_W)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
-        # Fight auto-exposure: in a dark room we want the LED as a tight dot,
-        # not a blown-out frame. Not all drivers honor these; harmless if ignored.
-        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-        cap.set(cv2.CAP_PROP_EXPOSURE, -6)
-
-        self.ok = cap.isOpened()
-        while not self._stop.is_set():
+        cap = self.cap
+        if cap is None:
+            return
+        while not self._halt.is_set():
             ret, frame = cap.read()
             if not ret:
                 time.sleep(0.05)
@@ -97,7 +96,6 @@ class Tracker(threading.Thread):
                 cv2.putText(dbg, "NO LED", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
             self.debug_frame = dbg
-        cap.release()
 
 # ----------------------------- Eye renderer ---------------------------------
 
@@ -128,8 +126,12 @@ class Eye:
         self.next_blink = time.time() + random.uniform(BLINK_MIN_GAP, BLINK_MAX_GAP)
         self.blink_start = None
 
+        self.saccade = [0.0, 0.0]
+        self.next_saccade = time.time() + random.uniform(SACCADE_MIN_GAP, SACCADE_MAX_GAP)
+
         self.dil_seed = random.random() * 100
-        self.sclera = radial_gradient_surface(self.eye_rx, (250, 248, 244), (150, 140, 138))
+        # Slightly grey, aged sclera reads creepier than bright white.
+        self.sclera = radial_gradient_surface(self.eye_rx, (238, 232, 222), (120, 105, 100))
 
         # Pre-render iris fibres (random radial lines) once.
         self.iris_surf = self._make_iris()
@@ -172,24 +174,36 @@ class Eye:
         if not tracking:
             if now >= self.next_idle:
                 self.idle_target = [random.uniform(-0.5, 0.5), random.uniform(-0.3, 0.3)]
-                self.next_idle = now + random.uniform(1.5, 4.0)
+                self.next_idle = now + random.uniform(2.0, 6.0)
             target = self.idle_target
+        if now >= self.next_saccade:
+            self.saccade = [random.uniform(-SACCADE_SIZE, SACCADE_SIZE),
+                            random.uniform(-SACCADE_SIZE, SACCADE_SIZE)]
+            self.next_saccade = now + random.uniform(SACCADE_MIN_GAP, SACCADE_MAX_GAP)
         for i in (0, 1):
-            self.gaze[i] += (target[i] - self.gaze[i]) * GAZE_SMOOTHING
+            self.gaze[i] += (target[i] + self.saccade[i] - self.gaze[i]) * GAZE_SMOOTHING
+            self.saccade[i] *= 0.94   # twitch decays back to true gaze
 
     def draw(self, now):
         s = self.screen
         s.fill((0, 0, 0))
         s.blit(self.sclera, (self.cx - self.eye_rx, self.cy - self.eye_rx))
 
-        # subtle veins
+        # bloodshot veins: jagged branching lines creeping in from the edge
         rng = random.Random(3)
-        for _ in range(10):
+        for _ in range(26):
             a = rng.uniform(0, 2 * math.pi)
-            r0, r1 = self.eye_rx * 0.75, self.eye_rx * 0.97
-            p0 = (self.cx + r0 * math.cos(a), self.cy + r0 * math.sin(a))
-            p1 = (self.cx + r1 * math.cos(a), self.cy + r1 * math.sin(a))
-            pygame.draw.aaline(s, (200, 150, 150), p0, p1)
+            r = self.eye_rx * rng.uniform(0.93, 0.99)
+            px, py = self.cx + r * math.cos(a), self.cy + r * math.sin(a)
+            col = (rng.randint(150, 195), rng.randint(45, 75), rng.randint(45, 70))
+            for _seg in range(rng.randint(3, 6)):
+                a += rng.uniform(-0.5, 0.5)
+                r -= self.eye_rx * rng.uniform(0.03, 0.09)
+                if r < self.eye_rx * 0.5:
+                    break
+                nx, ny = self.cx + r * math.cos(a), self.cy + r * math.sin(a)
+                pygame.draw.aaline(s, col, (px, py), (nx, ny))
+                px, py = nx, ny
 
         gx = self.cx + self.gaze[0] * self.max_travel
         gy = self.cy + self.gaze[1] * self.max_travel
@@ -228,13 +242,30 @@ class Eye:
 
 # ----------------------------- Main -----------------------------------------
 
+def open_camera():
+    """Must run on the main thread: macOS ties the camera permission prompt
+    to the main run loop."""
+    cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW if sys.platform == "win32" else 0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
+    # Fight auto-exposure: in a dark room we want the LED as a tight dot,
+    # not a blown-out frame. Not all drivers honor these; harmless if ignored.
+    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+    cap.set(cv2.CAP_PROP_EXPOSURE, -6)
+    # Force one read on the main thread so the permission dialog fires here.
+    cap.read()
+    return cap
+
+
 def main():
+    cap = open_camera()
+
     pygame.init()
     pygame.mouse.set_visible(False)
     screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
     clock = pygame.time.Clock()
 
-    tracker = Tracker()
+    tracker = Tracker(cap)
     tracker.start()
 
     eye = Eye(screen)
@@ -266,7 +297,14 @@ def main():
         clock.tick(60)
 
     tracker.stop()
+    tracker.join(timeout=1.0)
+    if cap is not None:
+        cap.release()
     pygame.quit()
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
