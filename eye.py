@@ -34,8 +34,8 @@ LOST_TIMEOUT = 1.5       # s without a blob before eye wanders idly
 
 # Eye look
 IRIS_COLOR = (70, 110, 140)     # steel blue; try (110, 80, 50) for brown
-BLINK_MIN_GAP, BLINK_MAX_GAP = 5.0, 14.0  # s between random blinks; long stares
-BLINK_DURATION = 0.30            # s for a full blink, slightly languid
+BLINK_MIN_GAP, BLINK_MAX_GAP = 12.0, 30.0 # s between random blinks; long stares
+BLINK_DURATION = 0.85            # s for a full blink, slow and heavy
 DILATION_PERIOD = 11.0           # s, slow random pupil size drift
 SACCADE_MIN_GAP, SACCADE_MAX_GAP = 0.6, 3.5  # s between micro-twitches
 SACCADE_SIZE = 0.11              # twitch amplitude in gaze units
@@ -156,6 +156,10 @@ class Eye:
         self.next_saccade = time.time() + self.rng.uniform(SACCADE_MIN_GAP, SACCADE_MAX_GAP)
 
         self.dil_seed = self.rng.random() * 100
+        # static-mode gaze: each eye stares off in its own direction,
+        # re-rolled every so often on its own clock
+        self.static_gaze = [self.rng.uniform(-0.8, 0.8), self.rng.uniform(-0.6, 0.6)]
+        self.next_static = 0.0
         # slight fixed gaze error per eye: almost-but-not-quite convergence
         self.skew = [self.rng.uniform(-0.06, 0.06), self.rng.uniform(-0.04, 0.04)]
 
@@ -274,19 +278,32 @@ class Eye:
         yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
         nxx = np.clip(np.abs(xx - cx) / hw, 0, 1)
         sheen = np.clip(1 - nxx ** 2, 0, 1)
-        g = 10 + 26 * (sheen ** 0.9)
+        g = 4 + 14 * (sheen ** 1.2)
         rng_np = np.random.default_rng(self.rng.randint(0, 1 << 30))
         g = np.clip(g + rng_np.normal(0, 3.5, g.shape), 0, 255)
         # faint horizontal crease striations, like stretched skin
         g = g + 3.0 * np.sin(yy / max(2.0, H / 26.0) + rng_np.uniform(0, 6.28))
         g = np.clip(g, 0, 255).astype(np.uint8)
 
+        # lens-shaped alpha with a feathered rim: lid fades into black near
+        # the eye outline rather than stopping at a hard edge
+        ht = hh * ((np.clip(1 - nxx ** 2, 1e-6, 1)) ** self.p) * self.squash * self.slit
+        hb = hh * ((np.clip(1 - nxx ** 2, 1e-6, 1)) ** self.p_bot) * self.slit
+        dyy = yy - cy
+        vy = np.where(dyy < 0, -dyy / np.maximum(ht, 1e-6),
+                      dyy / np.maximum(hb, 1e-6))
+        # darken the lid colour toward the rim so the closed pod melts into
+        # the black backdrop; alpha stays opaque so no sclera bleeds through
+        rim = np.clip((1 - np.maximum(np.clip(vy, 0, 2), nxx)) / 0.30, 0, 1)
+        gl = (g * (0.15 + 0.85 * rim ** 1.2)).astype(np.float32)
+        inside_lid = (vy <= 1.0) & (nxx < 1.0)
+
         def lid(curve_down):
             s = pygame.Surface((W, H), pygame.SRCALPHA)
-            pygame.surfarray.pixels3d(s)[:, :, 0] = g.T
-            pygame.surfarray.pixels3d(s)[:, :, 1] = (g * 0.94).astype(np.uint8).T
-            pygame.surfarray.pixels3d(s)[:, :, 2] = (g * 0.95).astype(np.uint8).T
-            pygame.surfarray.pixels_alpha(s)[:, :] = 255
+            pygame.surfarray.pixels3d(s)[:, :, 0] = gl.astype(np.uint8).T
+            pygame.surfarray.pixels3d(s)[:, :, 1] = (gl * 0.94).astype(np.uint8).T
+            pygame.surfarray.pixels3d(s)[:, :, 2] = (gl * 0.95).astype(np.uint8).T
+            pygame.surfarray.pixels_alpha(s)[:, :] = (inside_lid.T * 255).astype(np.uint8)
             # curved closing edge: carve the surface so its edge is an arc
             # bowing in the closing direction; edge line drawn along it
             sag = H * 0.10 * (1 if curve_down else -1)
@@ -307,10 +324,18 @@ class Eye:
             pygame.draw.polygon(carve, (0, 0, 0, 0), poly)
             s.blit(carve, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
             # lash-line: dark curve along the edge with a faint grey inner line
-            pygame.draw.lines(s, (5, 4, 5, 255), False, edge_pts, max(4, H // 34))
+            pygame.draw.lines(s, (2, 2, 2, 255), False, edge_pts, max(4, H // 34))
             inner = [(x, y - (H // 45) * (1 if curve_down else -1)) for x, y in edge_pts]
-            pygame.draw.lines(s, (52, 46, 48, 200), False, inner, max(2, H // 90))
+            pygame.draw.lines(s, (34, 30, 32, 150), False, inner, max(2, H // 90))
             return pygame.transform.smoothscale(s, (self.w, self.h))
+
+        # uncarved full-lens fill for the closed-state base coat
+        full = pygame.Surface((W, H), pygame.SRCALPHA)
+        pygame.surfarray.pixels3d(full)[:, :, 0] = gl.astype(np.uint8).T
+        pygame.surfarray.pixels3d(full)[:, :, 1] = (gl * 0.94).astype(np.uint8).T
+        pygame.surfarray.pixels3d(full)[:, :, 2] = (gl * 0.95).astype(np.uint8).T
+        pygame.surfarray.pixels_alpha(full)[:, :] = (inside_lid.T * 255).astype(np.uint8)
+        self.lid_full = pygame.transform.smoothscale(full, (self.w, self.h))
 
         return lid(True), lid(False)
 
@@ -405,12 +430,19 @@ class Eye:
         b = self._blink_amount(now)
         if b > 0:
             MEET = 0.74   # closure point as fraction of eye height (low)
-            # baked lids have their curved edge at the eye's vertical center;
-            # slide top lid down from -h/2 rest to (MEET-0.5)h at full close,
-            # bottom lid up from +h/2 rest to the same meeting point
-            top_off = int(self.h * (MEET * b - 0.5))
-            bot_off = int(self.h * (0.5 - (1 - MEET) * b))
+            SAG = 0.10    # baked edge sag: top edge at 0.5+SAG, bottom at 0.5-SAG
+            # slide so the curved edges actually land on MEET at full close
+            top_off = int(self.h * (-(0.5 + SAG) + b * (MEET + SAG)))
+            bot_off = int(self.h * ((0.5 + SAG) - b * ((0.5 + SAG) - (MEET - (0.5 - SAG)))))
+            bot_off = int(self.h * ((0.5 + SAG) - b * (0.5 + SAG - MEET + 0.5 - SAG)))
+            bot_off = int(self.h * ((0.5 + SAG) - b * (1.0 - MEET)))
             lids = pygame.Surface((self.w, self.h), pygame.SRCALPHA)
+            # near closure, fade in an unshifted full-lens base coat so no
+            # sclera can peek at the rim or corners in the closed state
+            if b > 0.7:
+                base = self.lid_full.copy()
+                base.set_alpha(int((b - 0.7) / 0.3 * 255))
+                lids.blit(base, (0, 0))
             # second blit above fills the strip the sliding lid uncovers
             if top_off > -self.h // 2:
                 lids.blit(self.lid_top, (0, top_off - int(self.h * 0.55)))
@@ -556,8 +588,8 @@ def main():
     follow = True    # M toggles: True = track the LED, False = static stare
     next_lock = time.time() + random.uniform(20, 45)
     lock_until = 0.0
-    next_sync_blink = time.time() + random.uniform(60, 120)
-    next_reloc = time.time() + random.uniform(35, 70)
+    next_sync_blink = time.time() + random.uniform(120, 210)
+    next_reloc = time.time() + random.uniform(12, 30)
     still_pos = (0.0, 0.0)
     still_since = time.time()
     # one eye per launch never blinks and never lets go
@@ -605,7 +637,7 @@ def main():
         if now >= next_sync_blink:
             for eye in eyes:
                 eye.force_blink = True
-            next_sync_blink = now + random.uniform(60, 120)
+            next_sync_blink = now + random.uniform(120, 210)
 
         # stillness response: person frozen -> saccades die, dead stare
         moved = math.hypot(tracker.pos[0] - still_pos[0],
@@ -631,9 +663,9 @@ def main():
                              (nx_ - e.cx) ** 2 + (ny_ - e.cy) ** 2 >=
                              ((mover.w + e.w) / 2 * 0.98) ** 2 for e in eyes)
                     if ok:
-                        mover.relocate(nx_, ny_, now, random.uniform(20, 40))
+                        mover.relocate(nx_, ny_, now, random.uniform(10, 22))
                         break
-            next_reloc = now + random.uniform(35, 70)
+            next_reloc = now + random.uniform(12, 30)
 
         for eye in eyes:
             eye.locked = locked
@@ -653,8 +685,13 @@ def main():
                     dx, dy = dx / mag, dy / mag
                 eye.update([dx, dy], tracking, now)
             else:
-                # static stare: dead ahead, twitches and blinks continue
-                eye.update([0.0, 0.0], True, now)
+                # static mode: each eye stares off in its own direction,
+                # drifting to a new one every so often
+                if now >= eye.next_static:
+                    eye.static_gaze = [eye.rng.uniform(-0.8, 0.8),
+                                       eye.rng.uniform(-0.6, 0.6)]
+                    eye.next_static = now + eye.rng.uniform(6.0, 18.0)
+                eye.update(eye.static_gaze, True, now)
             eye.draw(now)
 
         screen.blit(grunge, (0, 0))
