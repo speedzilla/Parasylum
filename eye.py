@@ -160,6 +160,7 @@ class Eye:
         self.skew = [self.rng.uniform(-0.06, 0.06), self.rng.uniform(-0.04, 0.04)]
 
         self.body = self._make_body()
+        self.lid_top, self.lid_bot = self._make_lids()
         # cached lens mask at display resolution, for clipping pupil and lids
         self.mask = pygame.Surface((self.w, self.h), pygame.SRCALPHA)
         outline, _, _ = lens_points(self.w, self.h, self.p, self.p_bot, self.squash * self.slit, self.slit)
@@ -260,6 +261,59 @@ class Eye:
         surf.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
         return pygame.transform.smoothscale(surf, (self.w, self.h))
 
+    def _make_lids(self):
+        """Near-black textured lid membranes with curved closing edges.
+        draw() slides them toward a low meeting point."""
+        S = 3
+        W, H = self.w * S, self.h * S
+        outline, hw, hh = lens_points(W, H, self.p, self.p_bot,
+                                      self.squash * self.slit, self.slit)
+        cx, cy = W / 2, H / 2
+
+        # near-black flesh texture: faint sheen + noise, reads as skin in the dark
+        yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+        nxx = np.clip(np.abs(xx - cx) / hw, 0, 1)
+        sheen = np.clip(1 - nxx ** 2, 0, 1)
+        g = 10 + 26 * (sheen ** 0.9)
+        rng_np = np.random.default_rng(self.rng.randint(0, 1 << 30))
+        g = np.clip(g + rng_np.normal(0, 3.5, g.shape), 0, 255)
+        # faint horizontal crease striations, like stretched skin
+        g = g + 3.0 * np.sin(yy / max(2.0, H / 26.0) + rng_np.uniform(0, 6.28))
+        g = np.clip(g, 0, 255).astype(np.uint8)
+
+        def lid(curve_down):
+            s = pygame.Surface((W, H), pygame.SRCALPHA)
+            pygame.surfarray.pixels3d(s)[:, :, 0] = g.T
+            pygame.surfarray.pixels3d(s)[:, :, 1] = (g * 0.94).astype(np.uint8).T
+            pygame.surfarray.pixels3d(s)[:, :, 2] = (g * 0.95).astype(np.uint8).T
+            pygame.surfarray.pixels_alpha(s)[:, :] = 255
+            # curved closing edge: carve the surface so its edge is an arc
+            # bowing in the closing direction; edge line drawn along it
+            sag = H * 0.10 * (1 if curve_down else -1)
+            edge_pts = []
+            steps = 60
+            for i in range(steps + 1):
+                fx = -1 + 2 * i / steps
+                x = cx + fx * hw
+                y = cy + sag * (1 - fx * fx)      # parabola bowing down/up
+                edge_pts.append((x, y))
+            # transparent beyond the edge (below for top lid, above for bottom)
+            if curve_down:
+                poly = edge_pts + [(W, H), (0, H)]
+            else:
+                poly = edge_pts + [(W, 0), (0, 0)]
+            carve = pygame.Surface((W, H), pygame.SRCALPHA)
+            carve.fill((255, 255, 255, 255))
+            pygame.draw.polygon(carve, (0, 0, 0, 0), poly)
+            s.blit(carve, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
+            # lash-line: dark curve along the edge with a faint grey inner line
+            pygame.draw.lines(s, (5, 4, 5, 255), False, edge_pts, max(4, H // 34))
+            inner = [(x, y - (H // 45) * (1 if curve_down else -1)) for x, y in edge_pts]
+            pygame.draw.lines(s, (52, 46, 48, 200), False, inner, max(2, H // 90))
+            return pygame.transform.smoothscale(s, (self.w, self.h))
+
+        return lid(True), lid(False)
+
     def _blink_amount(self, now):
         if now < self.sleep_until:
             return 1.0                 # relocating: stays shut
@@ -343,15 +397,27 @@ class Eye:
         layer = pygame.Surface((self.w, self.h), pygame.SRCALPHA)
         layer.blit(small, (px - box, py - box))
 
-        # blink lids: black covers from top and bottom
-        b = self._blink_amount(now)
-        if b > 0:
-            lid = int(self.h / 2 * b) + 1
-            pygame.draw.rect(layer, (0, 0, 0), (0, 0, self.w, lid))
-            pygame.draw.rect(layer, (0, 0, 0), (0, self.h - lid, self.w, lid))
-
         layer.blit(self.mask, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
         frame.blit(layer, (0, 0))
+
+        # eyelids: flesh membranes closing from top and bottom. The top lid
+        # slides down (its lower edge at h/2*b), the bottom lid slides up.
+        b = self._blink_amount(now)
+        if b > 0:
+            MEET = 0.74   # closure point as fraction of eye height (low)
+            # baked lids have their curved edge at the eye's vertical center;
+            # slide top lid down from -h/2 rest to (MEET-0.5)h at full close,
+            # bottom lid up from +h/2 rest to the same meeting point
+            top_off = int(self.h * (MEET * b - 0.5))
+            bot_off = int(self.h * (0.5 - (1 - MEET) * b))
+            lids = pygame.Surface((self.w, self.h), pygame.SRCALPHA)
+            # second blit above fills the strip the sliding lid uncovers
+            if top_off > -self.h // 2:
+                lids.blit(self.lid_top, (0, top_off - int(self.h * 0.55)))
+            lids.blit(self.lid_top, (0, top_off))
+            lids.blit(self.lid_bot, (0, bot_off))
+            lids.blit(self.mask, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
+            frame.blit(lids, (0, 0))
 
         rot = pygame.transform.rotozoom(frame, self.angle, 1.0)
         self.screen.blit(rot, rot.get_rect(center=(self.cx, self.cy)))
@@ -367,7 +433,7 @@ def layout_eyes(screen):
     w, h = screen.get_size()
     base = min(w, h)
     rng = random.Random()   # different arrangement every launch
-    n_eyes = NUM_EYES if NUM_EYES else rng.randint(9, 16)
+    n_eyes = NUM_EYES if NUM_EYES else rng.randint(13, 20)
     sizes = sorted((int(base * rng.uniform(*EYE_SIZE_RANGE) * 2)
                     for _ in range(n_eyes)), reverse=True)
     lo, hi = min(sizes), max(sizes)
@@ -383,13 +449,16 @@ def layout_eyes(screen):
             t = 0.5 if hi == lo else (hi - ew0) / (hi - lo)
             success = False
             for _try in range(1200):
-                # sample a point, then accept based on distance-from-center
-                x = rng.randint(ew // 2, max(ew // 2 + 1, w - ew // 2))
-                y = rng.randint(eh // 2, max(eh // 2 + 1, h - eh // 2))
+                # sample a point; margin covers the rotated bounding box so
+                # no eye is ever clipped by the screen edge
+                mx = int(ew * 0.58)
+                my = int(eh * 0.58) + int(ew * 0.14)  # tilt can add height
+                x = rng.randint(mx, max(mx + 1, w - mx))
+                y = rng.randint(my, max(my + 1, h - my))
                 dc = math.hypot((x - w / 2) / (w / 2), (y - h / 2) / (h / 2)) / math.sqrt(2)
-                # big eyes prefer small dc, small eyes prefer large dc
+                # gentle bias: big eyes lean central, small eyes lean outward
                 pref = 1 - abs(dc - t)
-                if rng.random() > pref ** 2:
+                if rng.random() > pref ** 0.7:
                     continue
                 pad = int(base * 0.035)
                 if all((x - px) ** 2 + (y - py) ** 2 >= ((ew + pw) / 2 * 0.98 + pad) ** 2
@@ -554,8 +623,10 @@ def main():
             if cand:
                 mover = random.choice(cand)
                 for _try in range(400):
-                    nx_ = random.randint(mover.w // 2, max(mover.w // 2 + 1, sw - mover.w // 2))
-                    ny_ = random.randint(mover.h // 2, max(mover.h // 2 + 1, sh - mover.h // 2))
+                    mx = int(mover.w * 0.58)
+                    my = int(mover.h * 0.58) + int(mover.w * 0.14)
+                    nx_ = random.randint(mx, max(mx + 1, sw - mx))
+                    ny_ = random.randint(my, max(my + 1, sh - my))
                     ok = all(e is mover or
                              (nx_ - e.cx) ** 2 + (ny_ - e.cy) ** 2 >=
                              ((mover.w + e.w) / 2 * 0.98) ** 2 for e in eyes)
