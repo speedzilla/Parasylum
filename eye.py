@@ -41,7 +41,7 @@ SACCADE_MIN_GAP, SACCADE_MAX_GAP = 0.6, 3.5  # s between micro-twitches
 SACCADE_SIZE = 0.11              # twitch amplitude in gaze units
 
 NUM_EYES = 14                    # eyes on screen, varied sizes, non-overlapping
-EYE_SIZE_RANGE = (0.05, 0.22)    # radius as fraction of screen's smaller dimension
+EYE_SIZE_RANGE = (0.045, 0.27)   # radius as fraction of screen's smaller dimension
 
 # ----------------------------- Tracker --------------------------------------
 
@@ -103,16 +103,19 @@ class Tracker(threading.Thread):
 
 # ----------------------------- Eye renderer ---------------------------------
 
-def lens_points(w, h, p, steps=90):
-    """Almond (lens) outline, pointed left/right. p controls pointiness."""
+def lens_points(w, h, p, p_bot=None, squash=1.0, squash_bot=1.0, steps=90):
+    """Almond (lens) outline, pointed left/right. p controls top pointiness,
+    p_bot the bottom (defaults to p); squash factors flatten the lids."""
+    if p_bot is None:
+        p_bot = p
     cx, cy = w / 2, h / 2
     hw, hh = w / 2 - 2, h / 2 - 2
     top, bot = [], []
     for i in range(steps + 1):
         x = -hw + 2 * hw * i / steps
-        y = hh * (max(0.0, 1 - (abs(x) / hw) ** 2)) ** p
-        top.append((cx + x, cy - y))
-        bot.append((cx + x, cy + y))
+        base = max(0.0, 1 - (abs(x) / hw) ** 2)
+        top.append((cx + x, cy - hh * (base ** p) * squash))
+        bot.append((cx + x, cy + hh * (base ** p_bot) * squash_bot))
     return top + bot[::-1], hw, hh
 
 
@@ -125,10 +128,19 @@ class Eye:
         self.cx, self.cy = cx, cy
         self.rng = random.Random(seed)
         self.w = width
-        self.h = int(width * self.rng.uniform(0.52, 0.62))
+        self.h = int(width * self.rng.uniform(0.54, 0.62))
         self.angle = self.rng.uniform(-16, 16)
         self.p = self.rng.uniform(0.55, 0.8)
-        self.pupil_frac = self.rng.uniform(0.60, 0.78)
+        self.p_bot = self.rng.uniform(0.55, 0.8)
+        self.squash = self.rng.uniform(0.85, 1.0)   # slight lid asymmetry only
+        self.slit = 1.0
+        self.pupil_frac = 0.68                       # scales with eye height
+        # uniform character, proportional to eye size
+        self.brightness = 1.0
+        self.noise_amt = 5.5
+        self.vein_count = max(8, self.w // 16)       # constant vein density
+        self.ring_shade = 110
+        self.locked = False
 
         self.gaze = [0.0, 0.0]
         self.idle_target = [0.0, 0.0]
@@ -141,26 +153,55 @@ class Eye:
         self.next_saccade = time.time() + self.rng.uniform(SACCADE_MIN_GAP, SACCADE_MAX_GAP)
 
         self.dil_seed = self.rng.random() * 100
+        # slight fixed gaze error per eye: almost-but-not-quite convergence
+        self.skew = [self.rng.uniform(-0.06, 0.06), self.rng.uniform(-0.04, 0.04)]
 
         self.body = self._make_body()
         # cached lens mask at display resolution, for clipping pupil and lids
         self.mask = pygame.Surface((self.w, self.h), pygame.SRCALPHA)
-        outline, _, _ = lens_points(self.w, self.h, self.p)
+        outline, _, _ = lens_points(self.w, self.h, self.p, self.p_bot, self.squash * self.slit, self.slit)
         pygame.draw.polygon(self.mask, (255, 255, 255, 255), outline)
 
     def _make_body(self):
         S = 2  # supersample, downscale = cheap blur
         W, H = self.w * S, self.h * S
-        surf = pygame.Surface((W, H), pygame.SRCALPHA)
-        outline, hw, hh = lens_points(W, H, self.p)
+        outline, hw, hh = lens_points(W, H, self.p, self.p_bot, self.squash * self.slit, self.slit)
         cx, cy = W / 2, H / 2
-        n = 16
-        for k in range(n):  # dark rim first, lighter and smaller toward center
-            t = k / (n - 1)
-            g = int(55 + 155 * (t ** 0.8))
-            scale = 1 - 0.055 * k
-            ring = [(cx + (px - cx) * scale, cy + (py - cy) * scale) for px, py in outline]
-            pygame.draw.polygon(surf, (g, g, g), ring)
+
+        # per-pixel smooth shading shaped to the lens: bright center falling
+        # to a dark rim along the eye's own contours; no rings
+        yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+        nx = np.clip(np.abs(xx - cx) / hw, 0, 1)
+        base = np.clip(1 - nx ** 2, 1e-6, 1)
+        ht = hh * (base ** self.p) * self.squash * self.slit   # local top half-height
+        hb = hh * (base ** self.p_bot) * self.slit             # local bottom half-height
+        dy = yy - cy
+        vy = np.where(dy < 0, -dy / np.maximum(ht, 1e-6),
+                      dy / np.maximum(hb, 1e-6))     # 0 center line, 1 at lid
+        inside = (vy <= 1.0) & (nx < 1.0)
+        t = np.clip((1 - nx ** 2) * (1 - np.clip(vy, 0, 1) ** 2), 0, 1)
+        g = (38 + 132 * (t ** 0.65)) * self.brightness
+        # organic fine noise
+        rng_np = np.random.default_rng(self.rng.randint(0, 1 << 30))
+        g = g + rng_np.normal(0, self.noise_amt, g.shape)
+        g = np.clip(g, 0, 255)
+
+        # ambient occlusion: soft shadow hanging from the top lid
+        lid_shadow = np.clip(1 - (1 + dy / np.maximum(ht, 1e-6)), 0, 1)  # 1 at top lid, 0 at center
+        shadow = np.where(dy < 0, lid_shadow ** 1.5 * 0.62, 0)
+        g = g * (1 - shadow)
+
+        g = np.clip(g, 0, 255)
+        rgb = np.repeat(g.astype(np.uint8)[:, :, None], 3, axis=2).astype(np.int16)
+        # sickly red tinge creeping in from the rim (low t = near edge)
+        rim = (1 - t) ** 3.2
+        rgb[:, :, 0] = np.clip(rgb[:, :, 0] + rim * 14, 0, 255)
+        rgb[:, :, 1] = np.clip(rgb[:, :, 1] - rim * 6, 0, 255)
+        rgb[:, :, 2] = np.clip(rgb[:, :, 2] - rim * 4, 0, 255)
+        rgb = rgb.astype(np.uint8)
+        surf = pygame.Surface((W, H), pygame.SRCALPHA)
+        pygame.surfarray.pixels3d(surf)[:, :, :] = np.transpose(rgb, (1, 0, 2))
+        pygame.surfarray.pixels_alpha(surf)[:, :] = (inside.T * 255).astype(np.uint8)
         grime = pygame.Surface((W, H), pygame.SRCALPHA)
         for _ in range(220):
             x = self.rng.randint(0, W - 1)
@@ -175,7 +216,7 @@ class Eye:
         # and rim toward the pupil zone; monochrome-dark red so they read as
         # veins without breaking the grayscale look
         veins = pygame.Surface((W, H), pygame.SRCALPHA)
-        for _ in range(18):
+        for _ in range(self.vein_count):
             # bias start points toward the pointed corners like real bloodshot
             corner = self.rng.random() < 0.55
             if corner:
@@ -190,7 +231,7 @@ class Eye:
                 a += math.pi  # head inward
             shade = self.rng.randint(70, 120)
             col = (shade, int(shade * 0.55), int(shade * 0.55),
-                   self.rng.randint(90, 150))
+                   self.rng.randint(120, 190))
             width = max(2, int(H * 0.012))
             for _seg in range(self.rng.randint(4, 8)):
                 a += self.rng.uniform(-0.55, 0.55)
@@ -214,6 +255,9 @@ class Eye:
         return pygame.transform.smoothscale(surf, (self.w, self.h))
 
     def _blink_amount(self, now):
+        if self.locked:
+            self.blink_start = None
+            return 0.0
         if self.blink_start is None:
             if now >= self.next_blink:
                 self.blink_start = now
@@ -231,12 +275,19 @@ class Eye:
                 self.idle_target = [self.rng.uniform(-0.5, 0.5), self.rng.uniform(-0.3, 0.3)]
                 self.next_idle = now + self.rng.uniform(2.0, 6.0)
             target = self.idle_target
+        if self.locked:
+            # lock-on: twitches stop, gaze snaps hard onto target
+            self.saccade = [0.0, 0.0]
+            for i in (0, 1):
+                self.gaze[i] += (target[i] - self.gaze[i]) * min(1.0, GAZE_SMOOTHING * 5)
+            return
         if now >= self.next_saccade:
             self.saccade = [self.rng.uniform(-SACCADE_SIZE, SACCADE_SIZE),
                             self.rng.uniform(-SACCADE_SIZE, SACCADE_SIZE)]
             self.next_saccade = now + self.rng.uniform(SACCADE_MIN_GAP, SACCADE_MAX_GAP)
         for i in (0, 1):
-            self.gaze[i] += (target[i] + self.saccade[i] - self.gaze[i]) * GAZE_SMOOTHING
+            self.gaze[i] += (target[i] + self.skew[i] + self.saccade[i]
+                             - self.gaze[i]) * GAZE_SMOOTHING
             self.saccade[i] *= 0.94
 
     def draw(self, now):
@@ -247,16 +298,37 @@ class Eye:
         # pupil with slow dilation drift
         d = 0.5 + 0.5 * math.sin(now * 2 * math.pi / DILATION_PERIOD + self.dil_seed)
         pr = int(hh * self.pupil_frac * (0.86 + 0.14 * d))
+        if self.locked:
+            pr = int(pr * 0.62)   # constricted stare
         px = cx + self.gaze[0] * (hw - pr) * 0.5
         py = cy + self.gaze[1] * (hh - pr) * 0.5
+        # draw the pupil supersampled in ITS OWN bounding box only, then
+        # downscale that box: soft edges without paying for the whole eye
+        S = 2
+        box = int(pr * 1.35) + 2            # half-size of bounding box
+        bw = box * 2
+        big = pygame.Surface((bw * S, bw * S), pygame.SRCALPHA)
+        bc = box * S                         # pupil center inside the box
+        bpr = pr * S
+        rs = self.ring_shade
+        pygame.draw.circle(big, (rs - 25,) * 3, (bc, bc), int(bpr * 1.22))
+        pygame.draw.circle(big, (rs,) * 3, (bc, bc), int(bpr * 1.14))
+        pygame.draw.circle(big, (max(20, rs - 60),) * 3, (bc, bc), int(bpr * 1.14),
+                           max(2, bpr // 9))
+        pygame.draw.circle(big, (30, 28, 32), (bc, bc), int(bpr * 1.03))
+        pygame.draw.circle(big, (10, 10, 12), (bc, bc), bpr)
+        # feathered highlights: translucent stacked circles (small temp surfaces)
+        for ox, oy, rr, a, col in ((-0.38, -0.38, 0.30, 60, 245),
+                                   (-0.38, -0.38, 0.22, 110, 245),
+                                   (-0.38, -0.38, 0.15, 220, 245),
+                                   (0.28, 0.22, 0.10, 90, 200)):
+            hr = max(2, int(bpr * rr))
+            hs = pygame.Surface((hr * 2, hr * 2), pygame.SRCALPHA)
+            pygame.draw.circle(hs, (col, col, col, a), (hr, hr), hr)
+            big.blit(hs, (bc + bpr * ox - hr, bc + bpr * oy - hr))
+        small = pygame.transform.smoothscale(big, (bw, bw))
         layer = pygame.Surface((self.w, self.h), pygame.SRCALPHA)
-        pygame.draw.circle(layer, (120, 120, 120), (px, py), int(pr * 1.16))
-        pygame.draw.circle(layer, (60, 60, 60), (px, py), int(pr * 1.16), max(2, pr // 9))
-        pygame.draw.circle(layer, (10, 10, 12), (px, py), pr)
-        pygame.draw.circle(layer, (240, 240, 240),
-                           (px - pr * 0.38, py - pr * 0.38), max(2, pr // 6))
-        pygame.draw.circle(layer, (170, 170, 170),
-                           (px + pr * 0.28, py + pr * 0.22), max(1, pr // 11))
+        layer.blit(small, (px - box, py - box))
 
         # blink lids: black covers from top and bottom
         b = self._blink_amount(now)
@@ -275,28 +347,48 @@ class Eye:
 # ----------------------------- Layout ---------------------------------------
 
 def layout_eyes(screen):
-    """Place NUM_EYES non-overlapping almond eyes of varied width via
-    rejection sampling; shrink and retry if the screen is too crowded."""
+    """Place NUM_EYES non-overlapping almond eyes. Sizes are pre-drawn, then
+    placed largest-first with a center bias proportional to size: big eyes
+    cluster toward the middle, small eyes scatter to the edges. Random, not
+    concentric: bias is a sampling preference, not a grid."""
     w, h = screen.get_size()
     base = min(w, h)
     rng = random.Random()   # different arrangement every launch
+    sizes = sorted((int(base * rng.uniform(*EYE_SIZE_RANGE) * 2)
+                    for _ in range(NUM_EYES)), reverse=True)
+    lo, hi = min(sizes), max(sizes)
     placed = []
-    attempts = 0
     scale = 1.0
-    while len(placed) < NUM_EYES:
-        ew = int(base * rng.uniform(*EYE_SIZE_RANGE) * 2 * scale)  # width
-        eh = int(ew * 0.62)
-        x = rng.randint(ew // 2, max(ew // 2 + 1, w - ew // 2))
-        y = rng.randint(eh // 2, max(eh // 2 + 1, h - eh // 2))
-        pad = int(base * 0.02)
-        if all((x - px) ** 2 + (y - py) ** 2 >= ((ew + pw) / 2 * 0.85 + pad) ** 2
-               for px, py, pw in placed):
-            placed.append((x, y, ew))
-        attempts += 1
-        if attempts > 4000:
-            scale *= 0.85
-            placed = []
-            attempts = 0
+    while True:
+        placed = []
+        ok = True
+        for ew0 in sizes:
+            ew = int(ew0 * scale)
+            eh = int(ew * 0.62)
+            # 0 = biggest -> hugs center; 1 = smallest -> pushed outward
+            t = 0.5 if hi == lo else (hi - ew0) / (hi - lo)
+            success = False
+            for _try in range(1200):
+                # sample a point, then accept based on distance-from-center
+                x = rng.randint(ew // 2, max(ew // 2 + 1, w - ew // 2))
+                y = rng.randint(eh // 2, max(eh // 2 + 1, h - eh // 2))
+                dc = math.hypot((x - w / 2) / (w / 2), (y - h / 2) / (h / 2)) / math.sqrt(2)
+                # big eyes prefer small dc, small eyes prefer large dc
+                pref = 1 - abs(dc - t)
+                if rng.random() > pref ** 2:
+                    continue
+                pad = int(base * 0.035)
+                if all((x - px) ** 2 + (y - py) ** 2 >= ((ew + pw) / 2 * 0.98 + pad) ** 2
+                       for px, py, pw in placed):
+                    placed.append((x, y, ew))
+                    success = True
+                    break
+            if not success:
+                ok = False
+                break
+        if ok:
+            break
+        scale *= 0.88
     return [Eye(screen, x, y, ew, seed=i * 977 + ew) for i, (x, y, ew) in enumerate(placed)]
 
 
@@ -392,6 +484,8 @@ def main():
     fullscreen = False
     debug = False
     follow = True    # M toggles: True = track the LED, False = static stare
+    next_lock = time.time() + random.uniform(20, 45)
+    lock_until = 0.0
     running = True
     while running:
         for ev in pygame.event.get():
@@ -426,6 +520,12 @@ def main():
 
         now = time.time()
         tracking = follow and (now - tracker.last_seen) < LOST_TIMEOUT
+        if now >= next_lock:
+            lock_until = now + random.uniform(2.0, 4.0)
+            next_lock = now + random.uniform(20, 45)
+        locked = now < lock_until
+        for eye in eyes:
+            eye.locked = locked
         # Project the LED onto a screen point, then aim each eye from its own
         # position toward that point so the eyes converge instead of moving
         # in lockstep.
