@@ -39,6 +39,9 @@ DILATION_PERIOD = 11.0           # s, slow random pupil size drift
 SACCADE_MIN_GAP, SACCADE_MAX_GAP = 3.0, 9.0  # s between micro-twitches
 SACCADE_SIZE = 0.045             # twitch amplitude in gaze units
 
+NUM_EYES = 7                     # eyes on screen, varied sizes, non-overlapping
+EYE_SIZE_RANGE = (0.10, 0.30)    # radius as fraction of screen's smaller dimension
+
 # ----------------------------- Tracker --------------------------------------
 
 class Tracker(threading.Thread):
@@ -111,30 +114,54 @@ def radial_gradient_surface(radius, inner, outer):
 
 
 class Eye:
-    def __init__(self, screen):
+    def __init__(self, screen, cx, cy, radius, seed=0):
         self.screen = screen
-        self.w, self.h = screen.get_size()
-        self.cx, self.cy = self.w // 2, self.h // 2
-        self.eye_rx = int(min(self.w, self.h) * 0.42)   # eyeball radius
+        self.cx, self.cy = cx, cy
+        self.eye_rx = radius
         self.iris_r = int(self.eye_rx * 0.42)
-        self.max_travel = self.eye_rx - self.iris_r - int(self.eye_rx * 0.06)
+        self.max_travel = self.eye_rx - self.iris_r - max(2, int(self.eye_rx * 0.06))
+        self.rng = random.Random(seed)
 
         self.gaze = [0.0, 0.0]           # smoothed, -1..1
         self.idle_target = [0.0, 0.0]
         self.next_idle = 0.0
 
-        self.next_blink = time.time() + random.uniform(BLINK_MIN_GAP, BLINK_MAX_GAP)
+        self.next_blink = time.time() + self.rng.uniform(BLINK_MIN_GAP, BLINK_MAX_GAP)
         self.blink_start = None
 
         self.saccade = [0.0, 0.0]
-        self.next_saccade = time.time() + random.uniform(SACCADE_MIN_GAP, SACCADE_MAX_GAP)
+        self.next_saccade = time.time() + self.rng.uniform(SACCADE_MIN_GAP, SACCADE_MAX_GAP)
 
-        self.dil_seed = random.random() * 100
+        self.dil_seed = self.rng.random() * 100
         # Slightly grey, aged sclera reads creepier than bright white.
         self.sclera = radial_gradient_surface(self.eye_rx, (238, 232, 222), (120, 105, 100))
 
         # Pre-render iris fibres (random radial lines) once.
         self.iris_surf = self._make_iris()
+
+        # Pre-render bloodshot veins to a surface (drawn per-eye each frame
+        # otherwise; static per eye so bake them once).
+        self.veins = self._make_veins()
+
+    def _make_veins(self):
+        size = self.eye_rx * 2
+        surf = pygame.Surface((size, size), pygame.SRCALPHA)
+        rng = random.Random(self.rng.randint(0, 9999))
+        c = self.eye_rx
+        for _ in range(26):
+            a = rng.uniform(0, 2 * math.pi)
+            r = self.eye_rx * rng.uniform(0.93, 0.99)
+            px, py = c + r * math.cos(a), c + r * math.sin(a)
+            col = (rng.randint(150, 195), rng.randint(45, 75), rng.randint(45, 70))
+            for _seg in range(rng.randint(3, 6)):
+                a += rng.uniform(-0.5, 0.5)
+                r -= self.eye_rx * rng.uniform(0.03, 0.09)
+                if r < self.eye_rx * 0.5:
+                    break
+                nx, ny = c + r * math.cos(a), c + r * math.sin(a)
+                pygame.draw.aaline(surf, col, (px, py), (nx, ny))
+                px, py = nx, ny
+        return surf
 
     def _make_iris(self):
         r = self.iris_r
@@ -166,44 +193,28 @@ class Eye:
         t = (now - self.blink_start) / BLINK_DURATION
         if t >= 1.0:
             self.blink_start = None
-            self.next_blink = now + random.uniform(BLINK_MIN_GAP, BLINK_MAX_GAP)
+            self.next_blink = now + self.rng.uniform(BLINK_MIN_GAP, BLINK_MAX_GAP)
             return 0.0
         return math.sin(t * math.pi)   # close then open
 
     def update(self, target, tracking, now):
         if not tracking:
             if now >= self.next_idle:
-                self.idle_target = [random.uniform(-0.5, 0.5), random.uniform(-0.3, 0.3)]
-                self.next_idle = now + random.uniform(2.0, 6.0)
+                self.idle_target = [self.rng.uniform(-0.5, 0.5), self.rng.uniform(-0.3, 0.3)]
+                self.next_idle = now + self.rng.uniform(2.0, 6.0)
             target = self.idle_target
         if now >= self.next_saccade:
-            self.saccade = [random.uniform(-SACCADE_SIZE, SACCADE_SIZE),
-                            random.uniform(-SACCADE_SIZE, SACCADE_SIZE)]
-            self.next_saccade = now + random.uniform(SACCADE_MIN_GAP, SACCADE_MAX_GAP)
+            self.saccade = [self.rng.uniform(-SACCADE_SIZE, SACCADE_SIZE),
+                            self.rng.uniform(-SACCADE_SIZE, SACCADE_SIZE)]
+            self.next_saccade = now + self.rng.uniform(SACCADE_MIN_GAP, SACCADE_MAX_GAP)
         for i in (0, 1):
             self.gaze[i] += (target[i] + self.saccade[i] - self.gaze[i]) * GAZE_SMOOTHING
             self.saccade[i] *= 0.94   # twitch decays back to true gaze
 
     def draw(self, now):
         s = self.screen
-        s.fill((0, 0, 0))
         s.blit(self.sclera, (self.cx - self.eye_rx, self.cy - self.eye_rx))
-
-        # bloodshot veins: jagged branching lines creeping in from the edge
-        rng = random.Random(3)
-        for _ in range(26):
-            a = rng.uniform(0, 2 * math.pi)
-            r = self.eye_rx * rng.uniform(0.93, 0.99)
-            px, py = self.cx + r * math.cos(a), self.cy + r * math.sin(a)
-            col = (rng.randint(150, 195), rng.randint(45, 75), rng.randint(45, 70))
-            for _seg in range(rng.randint(3, 6)):
-                a += rng.uniform(-0.5, 0.5)
-                r -= self.eye_rx * rng.uniform(0.03, 0.09)
-                if r < self.eye_rx * 0.5:
-                    break
-                nx, ny = self.cx + r * math.cos(a), self.cy + r * math.sin(a)
-                pygame.draw.aaline(s, col, (px, py), (nx, ny))
-                px, py = nx, ny
+        s.blit(self.veins, (self.cx - self.eye_rx, self.cy - self.eye_rx))
 
         gx = self.cx + self.gaze[0] * self.max_travel
         gy = self.cy + self.gaze[1] * self.max_travel
@@ -234,10 +245,32 @@ class Eye:
             pygame.draw.rect(s, (0, 0, 0), top)
             pygame.draw.rect(s, (0, 0, 0), bot)
 
-        # vignette mask: everything outside the eyeball stays black
-        # (cheap approach: draw a thick black ring)
-        pygame.draw.circle(s, (0, 0, 0), (self.cx, self.cy),
-                           self.eye_rx + self.eye_rx // 2, width=self.eye_rx // 2 + 4)
+
+# ----------------------------- Layout ---------------------------------------
+
+def layout_eyes(screen):
+    """Place NUM_EYES non-overlapping circles of varied radius via rejection
+    sampling. Deterministic-ish: retries shrink radii until everything fits."""
+    w, h = screen.get_size()
+    base = min(w, h)
+    rng = random.Random()   # different arrangement every launch
+    placed = []
+    attempts = 0
+    scale = 1.0
+    while len(placed) < NUM_EYES:
+        r = int(base * rng.uniform(*EYE_SIZE_RANGE) * scale)
+        x = rng.randint(r, w - r)
+        y = rng.randint(r, h - r)
+        pad = int(base * 0.015)
+        if all((x - px) ** 2 + (y - py) ** 2 >= (r + pr + pad) ** 2
+               for px, py, pr in placed):
+            placed.append((x, y, r))
+        attempts += 1
+        if attempts > 4000:          # too crowded, shrink and restart
+            scale *= 0.85
+            placed = []
+            attempts = 0
+    return [Eye(screen, x, y, r, seed=i * 977 + r) for i, (x, y, r) in enumerate(placed)]
 
 
 # ----------------------------- Main -----------------------------------------
@@ -268,7 +301,8 @@ def main():
     tracker = Tracker(cap)
     tracker.start()
 
-    eye = Eye(screen)
+    eyes = layout_eyes(screen)
+    sw, sh = screen.get_size()
     debug = False
     running = True
     while running:
@@ -283,8 +317,21 @@ def main():
 
         now = time.time()
         tracking = (now - tracker.last_seen) < LOST_TIMEOUT
-        eye.update(list(tracker.pos), tracking, now)
-        eye.draw(now)
+        # Project the LED onto a screen point, then aim each eye from its own
+        # position toward that point so the eyes converge instead of moving
+        # in lockstep.
+        tx = (tracker.pos[0] * 0.5 + 0.5) * sw
+        ty = (tracker.pos[1] * 0.5 + 0.5) * sh
+
+        screen.fill((0, 0, 0))
+        for eye in eyes:
+            dx = (tx - eye.cx) / (sw * 0.5)
+            dy = (ty - eye.cy) / (sh * 0.5)
+            mag = math.hypot(dx, dy)
+            if mag > 1.0:
+                dx, dy = dx / mag, dy / mag
+            eye.update([dx, dy], tracking, now)
+            eye.draw(now)
 
         if debug and tracker.debug_frame is not None:
             f = cv2.cvtColor(tracker.debug_frame, cv2.COLOR_BGR2RGB)
@@ -301,10 +348,6 @@ def main():
     if cap is not None:
         cap.release()
     pygame.quit()
-
-
-if __name__ == "__main__":
-    main()
 
 
 if __name__ == "__main__":
