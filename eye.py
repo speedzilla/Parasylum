@@ -40,8 +40,8 @@ DILATION_PERIOD = 11.0           # s, slow random pupil size drift
 SACCADE_MIN_GAP, SACCADE_MAX_GAP = 0.6, 3.5  # s between micro-twitches
 SACCADE_SIZE = 0.11              # twitch amplitude in gaze units
 
-NUM_EYES = 10                    # eyes on screen, varied sizes, non-overlapping
-EYE_SIZE_RANGE = (0.14, 0.30)    # radius as fraction of screen's smaller dimension
+NUM_EYES = 14                    # eyes on screen, varied sizes, non-overlapping
+EYE_SIZE_RANGE = (0.05, 0.22)    # radius as fraction of screen's smaller dimension
 
 # ----------------------------- Tracker --------------------------------------
 
@@ -128,7 +128,7 @@ class Eye:
         self.h = int(width * self.rng.uniform(0.52, 0.62))
         self.angle = self.rng.uniform(-16, 16)
         self.p = self.rng.uniform(0.55, 0.8)
-        self.pupil_frac = self.rng.uniform(0.38, 0.52)
+        self.pupil_frac = self.rng.uniform(0.60, 0.78)
 
         self.gaze = [0.0, 0.0]
         self.idle_target = [0.0, 0.0]
@@ -288,8 +288,8 @@ def layout_eyes(screen):
         eh = int(ew * 0.62)
         x = rng.randint(ew // 2, max(ew // 2 + 1, w - ew // 2))
         y = rng.randint(eh // 2, max(eh // 2 + 1, h - eh // 2))
-        pad = int(base * 0.005)
-        if all((x - px) ** 2 + (y - py) ** 2 >= ((ew + pw) / 2 * 0.72 + pad) ** 2
+        pad = int(base * 0.02)
+        if all((x - px) ** 2 + (y - py) ** 2 >= ((ew + pw) / 2 * 0.85 + pad) ** 2
                for px, py, pw in placed):
             placed.append((x, y, ew))
         attempts += 1
@@ -322,7 +322,8 @@ def make_grunge(w, h, seed=11):
 
     # dust specks
     for _ in range(w * h // 4500):
-        x = rng.randint(0, w - 1); y = rng.randint(0, h - 1)
+        x = rng.randint(0, w - 1)
+        y = rng.randint(0, h - 1)
         g = rng.randint(120, 220)
         surf.set_at((x, y), (g, g, g, rng.randint(20, 70)))
 
@@ -341,7 +342,8 @@ def make_grunge(w, h, seed=11):
 
     # smudges: big soft dark blotches
     for _ in range(18):
-        x = rng.randint(0, w - 1); y = rng.randint(0, h - 1)
+        x = rng.randint(0, w - 1)
+        y = rng.randint(0, h - 1)
         rad = rng.randint(int(h * 0.03), int(h * 0.12))
         blot = pygame.Surface((rad * 2, rad * 2), pygame.SRCALPHA)
         for rr in range(rad, 0, -2):
