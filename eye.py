@@ -37,11 +37,11 @@ IRIS_COLOR = (70, 110, 140)     # steel blue; try (110, 80, 50) for brown
 BLINK_MIN_GAP, BLINK_MAX_GAP = 5.0, 14.0  # s between random blinks; long stares
 BLINK_DURATION = 0.30            # s for a full blink, slightly languid
 DILATION_PERIOD = 11.0           # s, slow random pupil size drift
-SACCADE_MIN_GAP, SACCADE_MAX_GAP = 3.0, 9.0  # s between micro-twitches
-SACCADE_SIZE = 0.045             # twitch amplitude in gaze units
+SACCADE_MIN_GAP, SACCADE_MAX_GAP = 0.6, 3.5  # s between micro-twitches
+SACCADE_SIZE = 0.11              # twitch amplitude in gaze units
 
-NUM_EYES = 14                    # eyes on screen, varied sizes, non-overlapping
-EYE_SIZE_RANGE = (0.05, 0.22)    # radius as fraction of screen's smaller dimension
+NUM_EYES = 22                    # eyes on screen, varied sizes, non-overlapping
+EYE_SIZE_RANGE = (0.04, 0.19)    # radius as fraction of screen's smaller dimension
 
 # ----------------------------- Tracker --------------------------------------
 
@@ -128,7 +128,7 @@ class Eye:
         self.h = int(width * self.rng.uniform(0.52, 0.62))
         self.angle = self.rng.uniform(-16, 16)
         self.p = self.rng.uniform(0.55, 0.8)
-        self.pupil_frac = self.rng.uniform(0.60, 0.78)
+        self.pupil_frac = self.rng.uniform(0.38, 0.52)
 
         self.gaze = [0.0, 0.0]
         self.idle_target = [0.0, 0.0]
@@ -308,17 +308,17 @@ def make_grunge(w, h, seed=11):
     rng = random.Random(seed)
     surf = pygame.Surface((w, h), pygame.SRCALPHA)
 
-    # vignette: darkened corners/edges
-    steps = 26
-    maxr = int(math.hypot(w, h) * 0.62)
-    for k in range(steps):
-        t = k / (steps - 1)
-        a = int(110 * (t ** 2.2))
-        r = int(maxr * (1 - 0.35 * t))
-        ring = pygame.Surface((w, h), pygame.SRCALPHA)
-        pygame.draw.circle(ring, (0, 0, 0, a), (w // 2, h // 2), r,
-                           width=max(2, maxr // steps + 2))
-        surf.blit(ring, (0, 0))
+    # vignette: smooth per-pixel radial darkening (numpy, no banding)
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    nx = (xx - w / 2) / (w / 2)
+    ny = (yy - h / 2) / (h / 2)
+    dist = np.sqrt(nx * nx + ny * ny) / math.sqrt(2)
+    alpha = np.clip((dist - 0.55) / 0.45, 0, 1) ** 1.8 * 150
+    vig = pygame.Surface((w, h), pygame.SRCALPHA)
+    px = pygame.surfarray.pixels_alpha(vig)
+    px[:, :] = alpha.T.astype(np.uint8)
+    del px
+    surf.blit(vig, (0, 0))
 
     # dust specks
     for _ in range(w * h // 4500):
@@ -377,7 +377,7 @@ def main():
     # looks identical, but Cmd+Tab and system dialogs keep working on macOS.
     # Press F for true fullscreen if the window doesn't cover the screen.
     info = pygame.display.Info()
-    screen = pygame.display.set_mode((info.current_w, info.current_h), pygame.NOFRAME)
+    screen = pygame.display.set_mode((info.current_w, info.current_h), pygame.FULLSCREEN)
     clock = pygame.time.Clock()
 
     tracker = Tracker(cap)
@@ -389,6 +389,7 @@ def main():
     cam_index = CAM_INDEX
     fullscreen = False
     debug = False
+    follow = True    # M toggles: True = track the LED, False = static stare
     running = True
     while running:
         for ev in pygame.event.get():
@@ -399,9 +400,11 @@ def main():
                     running = False
                 if ev.key == pygame.K_d:
                     debug = not debug
+                if ev.key == pygame.K_m:
+                    follow = not follow
                 if ev.key == pygame.K_f:
                     fullscreen = not fullscreen
-                    flags = pygame.FULLSCREEN if fullscreen else pygame.NOFRAME
+                    flags = pygame.NOFRAME if fullscreen else pygame.FULLSCREEN
                     screen = pygame.display.set_mode((sw, sh), flags)
                     for e in eyes:
                         e.screen = screen
@@ -420,7 +423,7 @@ def main():
                     tracker.start()
 
         now = time.time()
-        tracking = (now - tracker.last_seen) < LOST_TIMEOUT
+        tracking = follow and (now - tracker.last_seen) < LOST_TIMEOUT
         # Project the LED onto a screen point, then aim each eye from its own
         # position toward that point so the eyes converge instead of moving
         # in lockstep.
@@ -429,12 +432,16 @@ def main():
 
         screen.fill((0, 0, 0))
         for eye in eyes:
-            dx = (tx - eye.cx) / (sw * 0.5)
-            dy = (ty - eye.cy) / (sh * 0.5)
-            mag = math.hypot(dx, dy)
-            if mag > 1.0:
-                dx, dy = dx / mag, dy / mag
-            eye.update([dx, dy], tracking, now)
+            if follow:
+                dx = (tx - eye.cx) / (sw * 0.5)
+                dy = (ty - eye.cy) / (sh * 0.5)
+                mag = math.hypot(dx, dy)
+                if mag > 1.0:
+                    dx, dy = dx / mag, dy / mag
+                eye.update([dx, dy], tracking, now)
+            else:
+                # static stare: dead ahead, twitches and blinks continue
+                eye.update([0.0, 0.0], True, now)
             eye.draw(now)
 
         screen.blit(grunge, (0, 0))
