@@ -1,4 +1,4 @@
-name: Build macOS apps
+name: Build macOS app
 
 on:
   push:
@@ -7,14 +7,7 @@ on:
 
 jobs:
   build:
-    strategy:
-      matrix:
-        include:
-          - os: macos-latest   # Apple Silicon (M1+)
-            arch: apple-silicon
-          - os: macos-13       # Intel
-            arch: intel
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-latest   # Apple Silicon (M1+)
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -28,8 +21,8 @@ jobs:
             "Add :NSCameraUsageDescription string 'The eye needs the camera to track the LED.'" \
             dist/WatchingEye.app/Contents/Info.plist
       - name: Zip app bundle (preserves structure)
-        run: ditto -c -k --keepParent dist/WatchingEye.app WatchingEye-${{ matrix.arch }}.zip
+        run: ditto -c -k --keepParent dist/WatchingEye.app WatchingEye-apple-silicon.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: WatchingEye-${{ matrix.arch }}
-          path: WatchingEye-${{ matrix.arch }}.zip
+          name: WatchingEye-apple-silicon
+          path: WatchingEye-apple-silicon.zip
