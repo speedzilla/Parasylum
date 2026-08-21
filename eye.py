@@ -40,8 +40,8 @@ DILATION_PERIOD = 11.0           # s, slow random pupil size drift
 SACCADE_MIN_GAP, SACCADE_MAX_GAP = 0.6, 3.5  # s between micro-twitches
 SACCADE_SIZE = 0.11              # twitch amplitude in gaze units
 
-NUM_EYES = 14                    # eyes on screen, varied sizes, non-overlapping
-EYE_SIZE_RANGE = (0.045, 0.27)   # radius as fraction of screen's smaller dimension
+NUM_EYES = None                  # None = random per launch (see layout_eyes)
+EYE_SIZE_RANGE = (0.07, 0.33)    # radius as fraction of screen's smaller dimension
 
 # ----------------------------- Tracker --------------------------------------
 
@@ -134,7 +134,7 @@ class Eye:
         self.p_bot = self.rng.uniform(0.55, 0.8)
         self.squash = self.rng.uniform(0.85, 1.0)   # slight lid asymmetry only
         self.slit = 1.0
-        self.pupil_frac = 0.68                       # scales with eye height
+        self.pupil_frac = 0.60                       # scales with eye height
         # uniform character, proportional to eye size
         self.brightness = 1.0
         self.noise_amt = 5.5
@@ -148,6 +148,9 @@ class Eye:
 
         self.next_blink = time.time() + self.rng.uniform(BLINK_MIN_GAP, BLINK_MAX_GAP)
         self.blink_start = None
+        self.never_blinks = False      # set by layout on one chosen eye
+        self.force_blink = False       # set by main for the simultaneous blink
+        self.sleep_until = 0.0         # closed-and-relocating state
 
         self.saccade = [0.0, 0.0]
         self.next_saccade = time.time() + self.rng.uniform(SACCADE_MIN_GAP, SACCADE_MAX_GAP)
@@ -163,7 +166,7 @@ class Eye:
         pygame.draw.polygon(self.mask, (255, 255, 255, 255), outline)
 
     def _make_body(self):
-        S = 2  # supersample, downscale = cheap blur
+        S = 3  # supersample, downscale = cheap blur
         W, H = self.w * S, self.h * S
         outline, hw, hh = lens_points(W, H, self.p, self.p_bot, self.squash * self.slit, self.slit)
         cx, cy = W / 2, H / 2
@@ -231,8 +234,9 @@ class Eye:
                 a += math.pi  # head inward
             shade = self.rng.randint(70, 120)
             col = (shade, int(shade * 0.55), int(shade * 0.55),
-                   self.rng.randint(120, 190))
+                   self.rng.randint(95, 150))
             width = max(2, int(H * 0.012))
+            soft = (col[0], col[1], col[2], max(30, col[3] // 3))
             for _seg in range(self.rng.randint(4, 8)):
                 a += self.rng.uniform(-0.55, 0.55)
                 step = self.rng.uniform(0.05, 0.11) * W
@@ -240,11 +244,13 @@ class Eye:
                 # stop before invading the pupil zone
                 if abs(nx - cx) < W * 0.16 and abs(ny - cy) < H * 0.2:
                     break
+                # soft pass (wide, faint) under a narrow core: fake blur
+                pygame.draw.line(veins, soft, (px, py), (nx, ny), width + 3)
                 pygame.draw.line(veins, col, (px, py), (nx, ny), width)
-                # occasional fork
                 if self.rng.random() < 0.3:
                     fa = a + self.rng.uniform(-1.0, 1.0)
                     fx, fy = nx + math.cos(fa) * step * 0.6, ny + math.sin(fa) * step * 0.6
+                    pygame.draw.line(veins, soft, (nx, ny), (fx, fy), width + 2)
                     pygame.draw.line(veins, col, (nx, ny), (fx, fy), max(1, width - 1))
                 px, py = nx, ny
                 width = max(1, width - (1 if self.rng.random() < 0.4 else 0))
@@ -255,8 +261,15 @@ class Eye:
         return pygame.transform.smoothscale(surf, (self.w, self.h))
 
     def _blink_amount(self, now):
-        if self.locked:
+        if now < self.sleep_until:
+            return 1.0                 # relocating: stays shut
+        if self.never_blinks:
             self.blink_start = None
+            return 0.0
+        if self.force_blink:
+            self.force_blink = False
+            self.blink_start = now
+        if self.locked and self.blink_start is None:
             return 0.0
         if self.blink_start is None:
             if now >= self.next_blink:
@@ -269,13 +282,18 @@ class Eye:
             return 0.0
         return math.sin(t * math.pi)
 
+    def relocate(self, x, y, now, closed_for):
+        """Close, hold shut, and reopen at a new position."""
+        self.sleep_until = now + closed_for
+        self.cx, self.cy = x, y
+
     def update(self, target, tracking, now):
         if not tracking:
             if now >= self.next_idle:
                 self.idle_target = [self.rng.uniform(-0.5, 0.5), self.rng.uniform(-0.3, 0.3)]
                 self.next_idle = now + self.rng.uniform(2.0, 6.0)
             target = self.idle_target
-        if self.locked:
+        if self.locked or self.never_blinks:
             # lock-on: twitches stop, gaze snaps hard onto target
             self.saccade = [0.0, 0.0]
             for i in (0, 1):
@@ -298,24 +316,19 @@ class Eye:
         # pupil with slow dilation drift
         d = 0.5 + 0.5 * math.sin(now * 2 * math.pi / DILATION_PERIOD + self.dil_seed)
         pr = int(hh * self.pupil_frac * (0.86 + 0.14 * d))
-        if self.locked:
-            pr = int(pr * 0.62)   # constricted stare
         px = cx + self.gaze[0] * (hw - pr) * 0.5
         py = cy + self.gaze[1] * (hh - pr) * 0.5
         # draw the pupil supersampled in ITS OWN bounding box only, then
         # downscale that box: soft edges without paying for the whole eye
-        S = 2
+        S = 3
         box = int(pr * 1.35) + 2            # half-size of bounding box
         bw = box * 2
         big = pygame.Surface((bw * S, bw * S), pygame.SRCALPHA)
         bc = box * S                         # pupil center inside the box
         bpr = pr * S
-        rs = self.ring_shade
-        pygame.draw.circle(big, (rs - 25,) * 3, (bc, bc), int(bpr * 1.22))
-        pygame.draw.circle(big, (rs,) * 3, (bc, bc), int(bpr * 1.14))
-        pygame.draw.circle(big, (max(20, rs - 60),) * 3, (bc, bc), int(bpr * 1.14),
-                           max(2, bpr // 9))
-        pygame.draw.circle(big, (30, 28, 32), (bc, bc), int(bpr * 1.03))
+        # ringless: a soft dark halo easing the pupil into the sclera
+        pygame.draw.circle(big, (52, 50, 54), (bc, bc), int(bpr * 1.18))
+        pygame.draw.circle(big, (30, 28, 32), (bc, bc), int(bpr * 1.08))
         pygame.draw.circle(big, (10, 10, 12), (bc, bc), bpr)
         # feathered highlights: translucent stacked circles (small temp surfaces)
         for ox, oy, rr, a, col in ((-0.38, -0.38, 0.30, 60, 245),
@@ -354,8 +367,9 @@ def layout_eyes(screen):
     w, h = screen.get_size()
     base = min(w, h)
     rng = random.Random()   # different arrangement every launch
+    n_eyes = NUM_EYES if NUM_EYES else rng.randint(9, 16)
     sizes = sorted((int(base * rng.uniform(*EYE_SIZE_RANGE) * 2)
-                    for _ in range(NUM_EYES)), reverse=True)
+                    for _ in range(n_eyes)), reverse=True)
     lo, hi = min(sizes), max(sizes)
     placed = []
     scale = 1.0
@@ -419,19 +433,6 @@ def make_grunge(w, h, seed=11):
         g = rng.randint(120, 220)
         surf.set_at((x, y), (g, g, g, rng.randint(20, 70)))
 
-    # scratches: long faint vertical-ish lines
-    for _ in range(10):
-        x = rng.randint(0, w - 1)
-        drift = rng.uniform(-0.06, 0.06)
-        g = rng.randint(140, 210)
-        a = rng.randint(10, 26)
-        y0 = rng.randint(0, h // 3)
-        y1 = rng.randint(2 * h // 3, h - 1)
-        pts = [(x + (y - y0) * drift + rng.uniform(-1, 1), y)
-               for y in range(y0, y1, 6)]
-        if len(pts) > 1:
-            pygame.draw.lines(surf, (g, g, g, a), False, pts, 1)
-
     # smudges: big soft dark blotches
     for _ in range(18):
         x = rng.randint(0, w - 1)
@@ -486,6 +487,12 @@ def main():
     follow = True    # M toggles: True = track the LED, False = static stare
     next_lock = time.time() + random.uniform(20, 45)
     lock_until = 0.0
+    next_sync_blink = time.time() + random.uniform(60, 120)
+    next_reloc = time.time() + random.uniform(35, 70)
+    still_pos = (0.0, 0.0)
+    still_since = time.time()
+    # one eye per launch never blinks and never lets go
+    random.choice(eyes).never_blinks = True
     running = True
     while running:
         for ev in pygame.event.get():
@@ -524,6 +531,39 @@ def main():
             lock_until = now + random.uniform(2.0, 4.0)
             next_lock = now + random.uniform(20, 45)
         locked = now < lock_until
+
+        # simultaneous blink: every eye blinks in the same frame, rarely
+        if now >= next_sync_blink:
+            for eye in eyes:
+                eye.force_blink = True
+            next_sync_blink = now + random.uniform(60, 120)
+
+        # stillness response: person frozen -> saccades die, dead stare
+        moved = math.hypot(tracker.pos[0] - still_pos[0],
+                           tracker.pos[1] - still_pos[1]) > 0.04
+        if moved or not tracking:
+            still_pos = tracker.pos
+            still_since = now
+        dead_stare = tracking and (now - still_since) > 10.0
+        if dead_stare:
+            locked = True   # reuse lock-on: no saccades, hard gaze, no blinks
+
+        # relocation: occasionally one eye closes and reopens elsewhere
+        if now >= next_reloc:
+            cand = [e for e in eyes if not e.never_blinks and now >= e.sleep_until]
+            if cand:
+                mover = random.choice(cand)
+                for _try in range(400):
+                    nx_ = random.randint(mover.w // 2, max(mover.w // 2 + 1, sw - mover.w // 2))
+                    ny_ = random.randint(mover.h // 2, max(mover.h // 2 + 1, sh - mover.h // 2))
+                    ok = all(e is mover or
+                             (nx_ - e.cx) ** 2 + (ny_ - e.cy) ** 2 >=
+                             ((mover.w + e.w) / 2 * 0.98) ** 2 for e in eyes)
+                    if ok:
+                        mover.relocate(nx_, ny_, now, random.uniform(20, 40))
+                        break
+            next_reloc = now + random.uniform(35, 70)
+
         for eye in eyes:
             eye.locked = locked
         # Project the LED onto a screen point, then aim each eye from its own
